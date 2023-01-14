@@ -558,7 +558,7 @@ static void ReadConfig(struct cache_config* Config){
 		SHGetKnownFolderPath(&FOLDERID_Profile, 0, NULL, &CachePath);
 		lstrcpyW(Config->CachePath, CachePath);
 		lstrcatW(Config->CachePath, L"\\.clcache");
-		CoTaskMemFree(CachePath);
+		// CoTaskMemFree(CachePath);
 
 		if(lstrlenW(Config->CachePath) + CACHE_PATH_LENGTH >= MAX_PATH)
 			FatalError(STR("Invalid cache path"), StringFromWchar(Config->CachePath));
@@ -1471,7 +1471,7 @@ int wmain(int argc, LPWSTR* argv){
 		ConfigFilePath[0] = '\0';
 		SHGetKnownFolderPath(&FOLDERID_LocalAppData, 0, NULL, &LocalAppData);
 		lstrcpyW(ConfigFilePath, LocalAppData);
-		CoTaskMemFree(LocalAppData);
+		// CoTaskMemFree(LocalAppData);
 		lstrcatW(ConfigFilePath, L"\\clcache");
 		MakePath(StringFromWchar(ConfigFilePath));
 		lstrcatW(ConfigFilePath, L"\\cache.config");
