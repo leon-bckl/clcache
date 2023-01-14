@@ -156,11 +156,12 @@ static struct string_buffer MakeStringBuffer(LPWSTR Data, size_t Size){
 }
 
 static LPWSTR PushChars(size_t Count, struct string_buffer* Buffer){
-	ASSERT(Buffer->Used + Count <= Buffer->Size);
+	ASSERT(Buffer->Used + Count + 1 <= Buffer->Size);
 
 	LPWSTR Result = Buffer->Data + Buffer->Used;
 
 	Buffer->Used += Count;
+	Buffer->Data[Buffer->Used] = '\0';
 
 	return Result;
 }
@@ -1255,8 +1256,85 @@ static struct string ReadUtf8FileToString(HANDLE File, struct memory_arena* Aren
 	return STR("");
 }
 
+static int InvokeCompiler(LPWSTR CmdLine, const struct cl_command_info* Command, struct string_buffer* CachePathBuffer, struct memory_arena* Arena){
+		WCHAR StdoutTempFileName[MAX_PATH];
+		WCHAR StderrTempFileName[MAX_PATH];
+
+		GetTempFileNameW(L".", L"err", 0, StdoutTempFileName);
+		GetTempFileNameW(L".", L"out", 0, StderrTempFileName);
+
+		SECURITY_ATTRIBUTES SecurityAttributes;
+		SecurityAttributes.nLength = sizeof(SecurityAttributes);
+		SecurityAttributes.lpSecurityDescriptor = NULL;
+		SecurityAttributes.bInheritHandle = TRUE;
+
+		HANDLE StdoutFile = CreateFileW(StdoutTempFileName,
+																		GENERIC_READ | GENERIC_WRITE,
+																		FILE_SHARE_READ | FILE_SHARE_WRITE,
+																		&SecurityAttributes,
+																		OPEN_ALWAYS,
+																		FILE_ATTRIBUTE_NORMAL,
+																		NULL);
+		HANDLE StderrFile = CreateFileW(StderrTempFileName,
+																		GENERIC_READ | GENERIC_WRITE,
+																		FILE_SHARE_READ | FILE_SHARE_WRITE,
+																		&SecurityAttributes,
+																		OPEN_ALWAYS,
+																		FILE_ATTRIBUTE_NORMAL,
+																		NULL);
+		PROCESS_INFORMATION Process;
+
+		StartProcess(CmdLine, &Process, StdoutFile, StderrFile);
+
+		int ExitCode = (int)WaitForProcessToFinish(&Process);
+
+		struct string StdoutString = ReadUtf8FileToString(StdoutFile, Arena);
+		struct string StderrString = ReadUtf8FileToString(StderrFile, Arena);
+
+		CloseHandle(StdoutFile);
+		CloseHandle(StderrFile);
+		DeleteFileW(StdoutTempFileName);
+		DeleteFileW(StderrTempFileName);
+		WriteConsoleFiltered(StdoutString, StdoutHandle, Command->ShowIncludes ? STR("") : StringFromWchar(ShowIncludeLineStart));
+		WriteConsoleFiltered(StderrString, StderrHandle, STR(""));
+
+		size_t CachePathLength = CachePathBuffer->Used;
+
+		MakePath(MakeString(CachePathBuffer->Data, CachePathBuffer->Used));
+
+		WCHAR TempPath[MAX_PATH];
+
+		CopyMemory(TempPath, Command->ObjFile.Data, Command->ObjFile.Length * sizeof(WCHAR));
+		TempPath[Command->ObjFile.Length] = '\0';
+		PushString(STR("obj"), CachePathBuffer);
+		CopyFileW(TempPath, CachePathBuffer->Data, FALSE);
+
+		if(Command->GeneratesPdb){
+			CopyMemory(TempPath, Command->PdbFile.Data, Command->PdbFile.Length * sizeof(WCHAR));
+			TempPath[Command->PdbFile.Length] = '\0';
+			CachePathBuffer->Used = CachePathLength;
+			PushString(STR("pdb"), CachePathBuffer);
+			CopyFileW(TempPath, CachePathBuffer->Data, FALSE);
+		}
+
+		CachePathBuffer->Used = CachePathLength;
+		PushString(STR("out"), CachePathBuffer);
+		WriteDataToFile(CachePathBuffer->Data, StdoutString.Data, StdoutString.Length * sizeof(WCHAR));
+
+		CachePathBuffer->Used = CachePathLength;
+		PushString(STR("err"), CachePathBuffer);
+		WriteDataToFile(CachePathBuffer->Data, StderrString.Data, StderrString.Length * sizeof(WCHAR));
+
+		struct dependency_info Deps = GenerateDeps(Command, StdoutString, Arena);
+		CachePathBuffer->Used = CachePathLength;
+		PushString(STR("dep"), CachePathBuffer);
+		WriteDepFile(CachePathBuffer->Data, &Deps, Arena);
+
+		return ExitCode;
+}
+
 static int CacheMain(int argc, LPWSTR* argv){
-	if(!StringEndsWith(StringFromWchar(argv[1]), STR("cl.exe"))){
+	if(!StringsAreEqual(FileNameWithoutPath(StringFromWchar(argv[1])), STR("cl.exe"))){
 		WriteStderr(STR("ERROR: First argument is expected to be the path to cl.exe"));
 
 		return 1;
@@ -1273,7 +1351,7 @@ static int CacheMain(int argc, LPWSTR* argv){
 		if(CacheUpToDate(&Command, &CachePathBuffer, &Arena)){
 			size_t CachePathLength = CachePathBuffer.Used;
 
-			PushString(STR("obj\0"), &CachePathBuffer);
+			PushString(STR("obj"), &CachePathBuffer);
 
 			WCHAR TempPath[MAX_PATH];
 
@@ -1282,9 +1360,12 @@ static int CacheMain(int argc, LPWSTR* argv){
 
 			if(!CopyFileW(CachePathBuffer.Data, TempPath, FALSE)){
 				WriteStderr(STR("Unable to copy cached obj file to destination: "));
+				WriteStderr(MakeString(CachePathBuffer.Data, CachePathBuffer.Used));
+				WriteStderr(STR(" -> "));
 				WriteStderr(StringFromWchar(TempPath));
 				WriteStderr(STR("\n"));
-				return 1;
+				CachePathBuffer.Used = CachePathLength;
+				return InvokeCompiler(CmdLine, &Command, &CachePathBuffer, &Arena);
 			}
 
 			if(Command.GeneratesPdb){
@@ -1296,9 +1377,12 @@ static int CacheMain(int argc, LPWSTR* argv){
 
 				if(!CopyFileW(CachePathBuffer.Data, TempPath, FALSE)){
 					WriteStderr(STR("Unable to copy cached pdb file to destination: "));
+					WriteStderr(MakeString(CachePathBuffer.Data, CachePathBuffer.Used));
+					WriteStderr(STR(" -> "));
 					WriteStderr(StringFromWchar(TempPath));
 					WriteStderr(STR("\n"));
-					return 1;
+					CachePathBuffer.Used = CachePathLength;
+					return InvokeCompiler(CmdLine, &Command, &CachePathBuffer, &Arena);
 				}
 			}
 
@@ -1312,80 +1396,7 @@ static int CacheMain(int argc, LPWSTR* argv){
 
 			return 0;
 		}else{
-			WCHAR StdoutTempFileName[MAX_PATH];
-			WCHAR StderrTempFileName[MAX_PATH];
-
-			GetTempFileNameW(L".", L"err", 0, StdoutTempFileName);
-			GetTempFileNameW(L".", L"out", 0, StderrTempFileName);
-
-			SECURITY_ATTRIBUTES SecurityAttributes;
-			SecurityAttributes.nLength = sizeof(SecurityAttributes);
-			SecurityAttributes.lpSecurityDescriptor = NULL;
-			SecurityAttributes.bInheritHandle = TRUE;
-
-			HANDLE StdoutFile = CreateFileW(StdoutTempFileName,
-			                                GENERIC_READ | GENERIC_WRITE,
-			                                FILE_SHARE_READ | FILE_SHARE_WRITE,
-			                                &SecurityAttributes,
-			                                OPEN_ALWAYS,
-			                                FILE_ATTRIBUTE_NORMAL,
-			                                NULL);
-			HANDLE StderrFile = CreateFileW(StderrTempFileName,
-			                                GENERIC_READ | GENERIC_WRITE,
-			                                FILE_SHARE_READ | FILE_SHARE_WRITE,
-			                                &SecurityAttributes,
-			                                OPEN_ALWAYS,
-			                                FILE_ATTRIBUTE_NORMAL,
-			                                NULL);
-			PROCESS_INFORMATION Process;
-
-			StartProcess(CmdLine, &Process, StdoutFile, StderrFile);
-
-			int ExitCode = (int)WaitForProcessToFinish(&Process);
-
-			struct string StdoutString = ReadUtf8FileToString(StdoutFile, &Arena);
-			struct string StderrString = ReadUtf8FileToString(StderrFile, &Arena);
-
-			CloseHandle(StdoutFile);
-			CloseHandle(StderrFile);
-			DeleteFileW(StdoutTempFileName);
-			DeleteFileW(StderrTempFileName);
-			WriteConsoleFiltered(StdoutString, StdoutHandle, Command.ShowIncludes ? STR("") : StringFromWchar(ShowIncludeLineStart));
-			WriteConsoleFiltered(StderrString, StderrHandle, STR(""));
-
-			size_t CachePathLength = CachePathBuffer.Used;
-
-			MakePath(MakeString(CachePathBuffer.Data, CachePathBuffer.Used));
-
-			WCHAR TempPath[MAX_PATH];
-
-			CopyMemory(TempPath, Command.ObjFile.Data, Command.ObjFile.Length * sizeof(WCHAR));
-			TempPath[Command.ObjFile.Length] = '\0';
-			PushString(STR("obj\0"), &CachePathBuffer);
-			CopyFileW(TempPath, CachePathBuffer.Data, FALSE);
-
-			if(Command.GeneratesPdb){
-				CopyMemory(TempPath, Command.PdbFile.Data, Command.PdbFile.Length * sizeof(WCHAR));
-				TempPath[Command.PdbFile.Length] = '\0';
-				CachePathBuffer.Used = CachePathLength;
-				PushString(STR("pdb\0"), &CachePathBuffer);
-				CopyFileW(TempPath, CachePathBuffer.Data, FALSE);
-			}
-
-			CachePathBuffer.Used = CachePathLength;
-			PushString(STR("out\0"), &CachePathBuffer);
-			WriteDataToFile(CachePathBuffer.Data, StdoutString.Data, StdoutString.Length * sizeof(WCHAR));
-
-			CachePathBuffer.Used = CachePathLength;
-			PushString(STR("err\0"), &CachePathBuffer);
-			WriteDataToFile(CachePathBuffer.Data, StderrString.Data, StderrString.Length * sizeof(WCHAR));
-
-			struct dependency_info Deps = GenerateDeps(&Command, StdoutString, &Arena);
-			CachePathBuffer.Used = CachePathLength;
-			PushString(STR("dep\0"), &CachePathBuffer);
-			WriteDepFile(CachePathBuffer.Data, &Deps, &Arena);
-
-			return ExitCode;
+			return InvokeCompiler(CmdLine, &Command, &CachePathBuffer, &Arena);
 		}
 	}else{ // Uncacheable so pass command line directly to cl.exe
 		LPWSTR CmdLine = GetCommandLineW();
@@ -1435,8 +1446,7 @@ static void PrintHelpText(void){
 #ifdef NO_CRT
 int mainCRTStartup(){
 	int argc = 0;
-	LPWSTR* argv =
-	CommandLineToArgvW(GetCommandLineW(), &argc);
+	LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
 #else
 int wmain(int argc, LPWSTR* argv){
 #endif
