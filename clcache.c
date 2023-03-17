@@ -3,6 +3,10 @@
 #include <shellapi.h>
 #include <ShlObj.h>
 
+#pragma comment(lib, "kernel32.lib")
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "Version.lib")
+
 #ifdef NO_CRT
 int _fltused;
 #pragma intrinsic(memset,memcpy,memmove,_byteswap_ulong,_byteswap_uint64)
@@ -19,7 +23,7 @@ int _fltused;
  * - stats (cache hits, misses etc.)
  * - shorten cache path (8 nested directories seems a little too much)
  * - clean up old cache entries
- * - scan files for __TIME__ macro and mark them as uncacheable
+ * - if an error occurs like not being able to read a file, just invoke the compiler and don't call FatalError
  */
 
 /*
@@ -54,9 +58,23 @@ int _fltused;
  * Structs
  */
 
+struct cstring{
+	const char* Data;
+	size_t      Length;
+};
+
+#define CSTR(str) (struct cstring){str, sizeof(str) - 1}
+
 struct string{
 	LPCWSTR Data;
 	size_t  Length;
+};
+
+#define STR(str) (struct string){L ## str, sizeof(L ## str) / sizeof(WCHAR) - 1}
+
+struct string_list{
+	struct string* Strings;
+	size_t         Count;
 };
 
 struct string_buffer{
@@ -66,6 +84,7 @@ struct string_buffer{
 };
 
 struct cache_config{
+	BOOL   UseStderr; // cl.exe writes warnings and errors to stdout this is optionally redirected to stderr by clcache
 	UINT64 CacheSize;
 	WCHAR  CachePath[MAX_PATH];
 };
@@ -91,12 +110,9 @@ struct cl_command_info{
 	struct string ObjFile;
 	struct string PdbFile;
 	struct string SrcFile;
-	int CompilerFlagCount;
-	struct string* CompilerFlags;
-	int IncludePathCount;
-	int SystemIncludePathCount;
-	struct string* IncludePaths;
-	struct string* SystemIncludePaths;
+	struct string_list CompilerFlags;
+	struct string_list IncludePaths;
+	struct string_list SystemIncludePaths;
 };
 
 struct dependency_entry{
@@ -115,12 +131,85 @@ struct dependency_info{
  * Globals
  */
 
-HANDLE              StdoutHandle;
-HANDLE              StderrHandle;
+HANDLE              g_StdoutHandle;
+HANDLE              g_StderrHandle;
 
-WCHAR               ConfigFilePath[MAX_PATH];
+WCHAR               g_ConfigFilePath[MAX_PATH];
 
-struct cache_config GlobalConfig;
+struct cache_config g_Config;
+
+/*
+ * Output
+ */
+
+static void WriteStdout(struct cstring Str){
+	DWORD NumBytesWritten;
+	WriteFile(g_StdoutHandle, Str.Data, (DWORD)Str.Length, &NumBytesWritten, NULL);
+}
+
+static void WriteStderr(struct cstring Str){
+	DWORD NumBytesWritten;
+	WriteFile(g_StderrHandle, Str.Data, (DWORD)Str.Length, &NumBytesWritten, NULL);
+}
+
+/*
+ * Error
+ */
+
+static __declspec(noreturn) void FatalError(struct cstring Msg){
+	WriteStderr(CSTR("ERROR: "));
+	WriteStderr(Msg);
+	WriteStderr(CSTR("\n"));
+	ExitProcess(1);
+}
+
+/*
+ * Memory
+ */
+
+static struct memory_arena CreateMemory(size_t Size){
+	struct memory_arena Arena;
+
+	// No need to free this. Just let the OS clean it all up when the process exits...
+	Arena.Memory = VirtualAlloc(NULL, Size, MEM_COMMIT, PAGE_READWRITE);
+
+	if(!Arena.Memory)
+		FatalError(CSTR("Failed to allocate virtual memory"));
+
+	Arena.Size = Size;
+	Arena.Used = 0;
+	Arena.PrevUsed = 0;
+
+	return Arena;
+}
+
+static void* PushMem(struct memory_arena* Arena, size_t Size){
+	if(Arena->Used + Size > Arena->Size)
+		FatalError(CSTR("Out of memory"));
+
+	void* Mem = (BYTE*)Arena->Memory + Arena->Used;
+
+	Arena->PrevUsed = Arena->Used;
+	Arena->Used += Size;
+	Arena->Used = ALIGN_POW2(Arena->Used, MEMORY_ALLOCATION_ALIGNMENT);
+
+	return Mem;
+}
+
+static void PopMem(struct memory_arena* Arena){
+	if(Arena->PrevUsed > 0){
+		Arena->Used = Arena->PrevUsed;
+		Arena->PrevUsed = 0;
+	}
+}
+
+static void PopPartialMem(struct memory_arena* Arena, size_t Size){
+	if(Size < Arena->Used && Arena->Used - Size >= Arena->PrevUsed){
+		Arena->Used -= Size;
+		Arena->Used = ALIGN_POW2(Arena->Used, MEMORY_ALLOCATION_ALIGNMENT);
+		Arena->PrevUsed = 0;
+	}
+}
 
 /*
  * String
@@ -130,7 +219,14 @@ static BOOL IsWhitespace(WCHAR C){ return C == ' ' || C == '\t' || C == '\n' || 
 static BOOL IsDigit(WCHAR C){ return C >= '0' && C <= '9'; }
 static BOOL IsPathSeparator(WCHAR C){ return C == '\\' || C == '/'; }
 
-#define STR(str) (struct string){L ## str, sizeof(L ## str) / sizeof(WCHAR) - 1}
+static struct cstring MakeCString(const char* Data, size_t Length){
+	struct cstring Result;
+
+	Result.Data = Data;
+	Result.Length = Length;
+
+	return Result;
+}
 
 static struct string MakeString(LPCWSTR Data, size_t Length){
 	struct string Result;
@@ -171,33 +267,44 @@ static struct string PushString(struct string Str, struct string_buffer* Buffer)
 	return Result;
 }
 
-static struct string PushCmdLineArg(struct string Str, struct string_buffer* Buffer){
-	if(Buffer->Used > 0 && !IsWhitespace(Buffer->Data[Buffer->Used]))
-		PushString(STR(" "), Buffer);
+static void PushStringWithEscapedQuotes(struct string Str, struct string_buffer* Buffer){
+	struct string Temp = Str;
+	Temp.Length = 0;
 
-	BOOL NeedQuotes = FALSE;
-
-	if(Str.Data[0] != '\"'){
-		for(size_t i = 0; !NeedQuotes && i < Str.Length; ++i){
-			if(IsWhitespace(Str.Data[i])){
-				NeedQuotes = TRUE;
-				break;
-			}
+	for(size_t i = 0; i < Str.Length; ++i){
+		if(Str.Data[i] == '\"'){
+			PushString(Temp, Buffer);
+			PushString(STR("\\\""), Buffer);
+			Temp = MakeString(Str.Data + i + 1, 0);
+		}else{
+			++Temp.Length;
 		}
 	}
 
-	if(NeedQuotes){
-		size_t Length = Str.Length + 2;
-		LPWSTR Data = PushChars(Length, Buffer);
+	PushString(Temp, Buffer);
+}
 
-		Data[0] = '\"';
-		CopyMemory(&Data[1], Str.Data, Str.Length * sizeof(WCHAR));
-		Data[Length - 1] = '\"';
+static void PushCmdLineArg(struct string Flag, struct string Arg, struct string_buffer* Buffer){
+	if(Buffer->Used > 0 && !IsWhitespace(Buffer->Data[Buffer->Used]))
+		PushString(STR(" \""), Buffer);
+	else
+		PushString(STR("\""), Buffer);
 
-		return MakeString(Data, Length);
-	}
+	PushStringWithEscapedQuotes(Flag, Buffer);
 
-	return PushString(Str, Buffer);
+	if(Arg.Length > 0)
+		PushStringWithEscapedQuotes(Arg, Buffer);
+
+	PushString(STR("\""), Buffer);
+}
+
+static struct cstring StringFromChar(const char* Str){
+	struct cstring Result;
+
+	Result.Data = Str;
+	Result.Length = lstrlenA(Str);
+
+	return Result;
 }
 
 static struct string StringFromWchar(LPCWSTR Str){
@@ -288,7 +395,10 @@ static BOOL StringEndsWithCaseInsensitive(struct string Str, struct string End){
 }
 
 static UINT64 StringToUINT64(struct string Str){
-	Str = TrimStringLeft(Str);
+	while(Str.Length > 0 && IsWhitespace(Str.Data[Str.Length - 1])){
+		++Str.Data;
+		--Str.Length;
+	}
 
 	UINT64 Result = 0;
 
@@ -308,28 +418,42 @@ static UINT64 StringToUINT64(struct string Str){
 	return Result;
 }
 
+static struct cstring UINT64ToCString(UINT64 Value, char* Buffer){
+	size_t DigitCount = 1;
+
+	for(UINT64 i = 10; i <= Value; i *= 10)
+		++DigitCount;
+
+	for(size_t i = DigitCount; i > 0; --i){
+		Buffer[i - 1] = '0' + (Value % 10);
+		Value /= 10;
+	}
+
+	return MakeCString(Buffer, DigitCount);
+}
+
 static struct string UINT64ToString(UINT64 Value, struct string_buffer* Buffer){
 	size_t DigitCount = 1;
 
 	for(UINT64 i = 10; i <= Value; i *= 10)
 		++DigitCount;
 
-	LPWSTR Data = PushChars(DigitCount, Buffer);
+	WCHAR* Dest = PushChars(DigitCount, Buffer);
 
 	for(size_t i = DigitCount; i > 0; --i){
-		Data[i - 1] = '0' + (WCHAR)(Value % 10);
+		Dest[i - 1] = '0' + (Value % 10);
 		Value /= 10;
 	}
 
-	return MakeString(Data, DigitCount);
+	return MakeString(Dest, DigitCount);
 }
 
-static struct string FloatToString(float Value, struct string_buffer* Buffer){
-	struct string Result = UINT64ToString((UINT64)Value, Buffer);
+static struct cstring FloatToString(float Value, char* Buffer){
+	struct cstring Result = UINT64ToCString((UINT64)Value, Buffer);
 
-	Result.Length += PushString(STR("."), Buffer).Length;
+	Buffer[Result.Length++] = '.';
 	// 2 digits of precision is enough. This is only used to print percentages for stats.
-	Result.Length += UINT64ToString((UINT64)((Value - (float)(UINT64)Value) * 100.0f), Buffer).Length;
+	Result.Length += UINT64ToCString((UINT64)((Value - (float)(UINT64)Value) * 100.0f), Buffer).Length;
 
 	return Result;
 }
@@ -364,101 +488,55 @@ static struct string PathWithoutFileName(struct string Path){
 	return MakeString(Path.Data, 0);
 }
 
-static void SortStrings(struct string* Strings, int Count){
+static void SortStrings(struct string_list List){
 	struct string Temp;
 
-	for(int i = 1; i < Count; ++i){
-		if(CompareStrings(Strings[i], Strings[i - 1]) < 0){
-			Temp = Strings[i];
-			Strings[i] = Strings[i - 1];
-			Strings[i - 1] = Temp;
+	for(int i = 1; i < List.Count; ++i){
+		if(CompareStrings(List.Strings[i], List.Strings[i - 1]) < 0){
+			Temp = List.Strings[i];
+			List.Strings[i] = List.Strings[i - 1];
+			List.Strings[i - 1] = Temp;
 
 			for(int j = i - 1; j > 0; --j){
-				if(CompareStrings(Strings[j], Strings[j - 1]) < 0){
-					Temp = Strings[j];
-					Strings[j] = Strings[j - 1];
-					Strings[j - 1] = Temp;
+				if(CompareStrings(List.Strings[j], List.Strings[j - 1]) < 0){
+					Temp = List.Strings[j];
+					List.Strings[j] = List.Strings[j - 1];
+					List.Strings[j - 1] = Temp;
 				}
 			}
 		}
 	}
 }
 
-/*
- * Output
- */
+struct string_list SplitString(struct string Str, WCHAR Separator, struct memory_arena* Arena){
+	struct string_list List = {0};
 
-static void WriteStdout(struct string Str){
-	WriteConsoleW(StdoutHandle, Str.Data, (DWORD)Str.Length, NULL, NULL);
-}
-
-static void WriteStderr(struct string Str){
-	WriteConsoleW(StderrHandle, Str.Data, (DWORD)Str.Length, NULL, NULL);
-}
-
-/*
- * Error
- */
-
-static __declspec(noreturn) void FatalError(struct string Msg, struct string Context){
-	WriteStderr(STR("ERROR: "));
-	WriteStderr(Msg);
-
-	if(Context.Length > 0){
-		WriteStderr(STR(": "));
-		WriteStderr(Context);
+	for(size_t i = 0; i < Str.Length; ++i){
+		if(Str.Data[i] == Separator)
+			++List.Count;
 	}
 
-	WriteStderr(STR("\n"));
-	ExitProcess(1);
-}
+	if(List.Count == 0)
+		return List;
 
-/*
- * Memory
- */
+	List.Strings = PushMem(Arena, List.Count * sizeof(struct string));
 
-static struct memory_arena CreateMemory(size_t Size){
-	struct memory_arena Arena;
+	struct string* Path = List.Strings;
+	Path->Data = Str.Data;
+	Path->Length = 0;
 
-	// No need to free this. Just let the OS clean it all up when the process exits...
-	Arena.Memory = VirtualAlloc(NULL, Size, MEM_COMMIT, PAGE_READWRITE);
+	for(size_t i = 0; i < Str.Length; ++i){
+		if(Str.Data[i] == Separator){
+			++Path;
+			Path->Data = Str.Data + i + 1;
+			Path->Length = 0;
+			continue;
+		}
 
-	if(!Arena.Memory)
-		FatalError(STR("Unable to allocate virtual memory"), STR(""));
-
-	Arena.Size = Size;
-	Arena.Used = 0;
-	Arena.PrevUsed = 0;
-
-	return Arena;
-}
-
-static void* PushMem(struct memory_arena* Arena, size_t Size){
-	if(Arena->Used + Size > Arena->Size)
-		FatalError(STR("Out of memory"), STR(""));
-
-	void* Mem = (BYTE*)Arena->Memory + Arena->Used;
-
-	Arena->PrevUsed = Arena->Used;
-	Arena->Used += Size;
-	Arena->Used = ALIGN_POW2(Arena->Used, MEMORY_ALLOCATION_ALIGNMENT);
-
-	return Mem;
-}
-
-static void PopMem(struct memory_arena* Arena){
-	if(Arena->PrevUsed > 0){
-		Arena->Used = Arena->PrevUsed;
-		Arena->PrevUsed = 0;
+		++Path->Length;
 	}
-}
 
-static void PopPartialMem(struct memory_arena* Arena, size_t Size){
-	if(Size < Arena->Used && Arena->Used - Size >= Arena->PrevUsed){
-		Arena->Used -= Size;
-		Arena->Used = ALIGN_POW2(Arena->Used, MEMORY_ALLOCATION_ALIGNMENT);
-		Arena->PrevUsed = 0;
-	}
+	return List;
 }
 
 /*
@@ -467,7 +545,7 @@ static void PopPartialMem(struct memory_arena* Arena, size_t Size){
 
 static void MakePath(struct string Path){
 	if(Path.Length >= MAX_PATH)
-		FatalError(STR("Path length limit exceeded"), Path);
+		FatalError(CSTR("Path length limit exceeded"));
 
 	WCHAR TempPath[MAX_PATH];
 
@@ -486,7 +564,7 @@ static void MakePath(struct string Path){
 
 		if(Attribs == INVALID_FILE_ATTRIBUTES || (Attribs & FILE_ATTRIBUTE_DIRECTORY) == 0){
 			if(!CreateDirectoryW(TempPath, NULL))
-				FatalError(STR("Unable to create directory"), MakeString(TempPath, (size_t)(p - TempPath)));
+				FatalError(CSTR("Failed to create directory"));
 		}
 
 		*p = Temp;
@@ -500,7 +578,7 @@ static BOOL FileExists(LPCWSTR Path){
 static BOOL GetFileSizeLastModified(LPCWSTR filePath, UINT64* FileSize, UINT64* LastModified){
 	WIN32_FILE_ATTRIBUTE_DATA FileAttribData;
 
-	if(GetFileAttributesExW(filePath, GetFileExInfoStandard, &FileAttribData)){
+	if(GetFileAttributesExW(filePath, GetFileExInfoStandard, &FileAttribData) && (FileAttribData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0){
 		*FileSize = (UINT64)FileAttribData.nFileSizeHigh << 32 | FileAttribData.nFileSizeLow;
 		*LastModified = (UINT64)FileAttribData.ftLastWriteTime.dwHighDateTime << 32 | FileAttribData.ftLastWriteTime.dwLowDateTime;
 
@@ -510,24 +588,33 @@ static BOOL GetFileSizeLastModified(LPCWSTR filePath, UINT64* FileSize, UINT64* 
 	return FALSE;
 }
 
-static void* ReadDataFromFile(LPCWSTR Path, struct memory_arena* Arena, UINT64* Size){
-	HANDLE File = CreateFileW(Path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-
-	if(File == INVALID_HANDLE_VALUE)
-		FatalError(STR("Unable to open file for reading"), StringFromWchar(Path));
+static void* ReadDataFromFileHandle(HANDLE Handle, struct memory_arena* Arena, size_t* Size){
+	if(SetFilePointer(Handle, 0, NULL, FILE_BEGIN) == INVALID_SET_FILE_POINTER)
+		FatalError(CSTR("Failed to read compiler output file"));
 
 	LARGE_INTEGER FileSize;
 
-	if(!GetFileSizeEx(File, &FileSize))
-		FatalError(STR("Unable to determine file size"), StringFromWchar(Path));
+	if(!GetFileSizeEx(Handle, &FileSize))
+		FatalError(CSTR("Failed to determine file size"));
 
 	*Size = FileSize.QuadPart;
 
-	LPWSTR Content = PushMem(Arena, FileSize.QuadPart);
+	void* Content = PushMem(Arena, FileSize.QuadPart);
 	DWORD NumBytesRead;
 
-	if(!ReadFile(File, Content, (DWORD)FileSize.QuadPart, &NumBytesRead, NULL))
-		FatalError(STR("Unable to read from file"), StringFromWchar(Path));
+	if(!ReadFile(Handle, Content, (DWORD)FileSize.QuadPart, &NumBytesRead, NULL))
+		FatalError(CSTR("Failed to read from file"));
+
+	return Content;
+}
+
+static void* ReadDataFromFile(LPCWSTR Path, struct memory_arena* Arena, size_t* Size){
+	HANDLE File = CreateFileW(Path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+
+	if(File == INVALID_HANDLE_VALUE)
+		FatalError(CSTR("Failed to open file for reading"));
+
+	void* Content = ReadDataFromFileHandle(File, Arena, Size);
 
 	CloseHandle(File);
 
@@ -538,12 +625,12 @@ static void WriteDataToFile(LPCWSTR Path, const void* Data, size_t Size){
 	HANDLE File = CreateFileW(Path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
 
 	if(File == INVALID_HANDLE_VALUE)
-		FatalError(STR("Unable to open file for writing"), StringFromWchar(Path));
+		FatalError(CSTR("Failed to open file for writing"));
 
 	DWORD NumBytesWritten;
 
 	if(!WriteFile(File, Data, (DWORD)Size, &NumBytesWritten, NULL))
-		FatalError(STR("Unable to write to file"), StringFromWchar(Path));
+		FatalError(CSTR("Failed to write to file"));
 
 	CloseHandle(File);
 }
@@ -553,15 +640,15 @@ static void WriteDataToFile(LPCWSTR Path, const void* Data, size_t Size){
  */
 
 static void WriteConfig(struct cache_config* Config){
-	WriteDataToFile(ConfigFilePath, Config, sizeof(*Config));
+	WriteDataToFile(g_ConfigFilePath, Config, sizeof(*Config));
 }
 
 static void ReadConfig(struct cache_config* Config){
-	if(FileExists(ConfigFilePath)){
-		HANDLE File = CreateFileW(ConfigFilePath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+	if(FileExists(g_ConfigFilePath)){
+		HANDLE File = CreateFileW(g_ConfigFilePath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
 
 		if(File == INVALID_HANDLE_VALUE)
-			FatalError(STR("Unable to open configuration file for reading"), StringFromWchar(ConfigFilePath));
+			FatalError(CSTR("Failed to open configuration file for reading"));
 
 		DWORD NumBytesRead;
 		BOOL Success = ReadFile(File, Config, sizeof(*Config), &NumBytesRead, NULL);
@@ -569,7 +656,7 @@ static void ReadConfig(struct cache_config* Config){
 		CloseHandle(File);
 
 		if(!Success)
-			FatalError(STR("Unable to read from configuration file"), StringFromWchar(ConfigFilePath));
+			FatalError(CSTR("Failed to read from configuration file"));
 	}else{ // Initialize config with default values and write it to the file
 		PWSTR CachePath;
 
@@ -581,7 +668,7 @@ static void ReadConfig(struct cache_config* Config){
 		// CoTaskMemFree(CachePath);
 
 		if(lstrlenW(Config->CachePath) + CACHE_PATH_LENGTH >= MAX_PATH)
-			FatalError(STR("Invalid cache path"), StringFromWchar(Config->CachePath));
+			FatalError(CSTR("Invalid cache path"));
 
 		WriteConfig(Config);
 	}
@@ -591,21 +678,24 @@ static void ReadConfig(struct cache_config* Config){
  * Process
  */
 
-static void StartProcess(LPWSTR CmdLine, LPPROCESS_INFORMATION ProcessInfo, HANDLE Out, HANDLE Err){
+static void StartProcess(LPWSTR CmdLine, LPPROCESS_INFORMATION ProcessInfo, BOOL Detached, HANDLE Out, HANDLE Err){
 	STARTUPINFOW StartupInfo = {0};
+	DWORD CreationFlags = 0;
 
 	StartupInfo.cb = sizeof(StartupInfo);
 
-	if(Out != INVALID_HANDLE_VALUE || Err != INVALID_HANDLE_VALUE){
+	if(Detached){
+		CreationFlags |= DETACHED_PROCESS;
+	}else if(Out != INVALID_HANDLE_VALUE || Err != INVALID_HANDLE_VALUE){
 		StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
-		StartupInfo.hStdOutput = Out == INVALID_HANDLE_VALUE ? StdoutHandle : Out;
-		StartupInfo.hStdError = Err == INVALID_HANDLE_VALUE ? StderrHandle : Err;
+		StartupInfo.hStdOutput = Out == INVALID_HANDLE_VALUE ? g_StdoutHandle : Out;
+		StartupInfo.hStdError = Err == INVALID_HANDLE_VALUE ? g_StderrHandle : Err;
 	}
 
 	ZeroMemory(ProcessInfo, sizeof(*ProcessInfo));
 
-	if(!CreateProcessW(NULL, CmdLine, NULL, NULL, TRUE, CREATE_NO_WINDOW, 0, NULL, &StartupInfo, ProcessInfo))
-		FatalError(STR("Unable to start process"), StringFromWchar(CmdLine));
+	if(!CreateProcessW(NULL, CmdLine, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &StartupInfo, ProcessInfo))
+		FatalError(CSTR("Failed to start process"));
 }
 
 static DWORD WaitForProcessToFinish(LPPROCESS_INFORMATION ProcessInfo){
@@ -654,12 +744,12 @@ static UINT64 HashFileContent(LPCWSTR FilePath, struct memory_arena* Arena){
 	HANDLE File = CreateFileW(FilePath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
 
 	if(File == INVALID_HANDLE_VALUE)
-		FatalError(STR("Unable to open file"), StringFromWchar(FilePath));
+		FatalError(CSTR("Failed to open file"));
 
 	LARGE_INTEGER FileSize;
 
 	if(!GetFileSizeEx(File, &FileSize))
-		FatalError(STR("Unable to determine file size"), StringFromWchar(FilePath));
+		FatalError(CSTR("Failed to determine file size"));
 
 	if(FileSize.QuadPart == 0)
 		return 0;
@@ -668,7 +758,7 @@ static UINT64 HashFileContent(LPCWSTR FilePath, struct memory_arena* Arena){
 	DWORD NumBytesRead;
 
 	if(!ReadFile(File, Data, (DWORD)FileSize.QuadPart, &NumBytesRead, NULL))
-		FatalError(STR("Unable to read from file"), StringFromWchar(FilePath));
+		FatalError(CSTR("Failed to read from file"));
 
 	UINT64 Hash = XXH3_64bits(Data, FileSize.QuadPart);
 
@@ -706,12 +796,12 @@ static BOOL BuildCommandInfo(int argc, LPWSTR* argv, struct cl_command_info* Com
 	if(!Command->ClVersion)
 		return FALSE;
 
-	Command->IncludePaths = PushMem(Arena, argc * sizeof(struct string));
-	Command->CompilerFlags = PushMem(Arena, (argc - 2) * sizeof(struct string));
+	Command->IncludePaths.Strings = PushMem(Arena, argc * sizeof(struct string));
+	Command->CompilerFlags.Strings = PushMem(Arena, (argc - 2) * sizeof(struct string));
 
-	Command->IncludePathCount = 1;
-	Command->IncludePaths[0].Data = PushMem(Arena, MAX_PATH);
-	Command->IncludePaths[0].Length = GetCurrentDirectoryW(MAX_PATH, (LPWSTR)Command->IncludePaths[0].Data);
+	Command->IncludePaths.Count = 1;
+	Command->IncludePaths.Strings[0].Data = PushMem(Arena, MAX_PATH);
+	Command->IncludePaths.Strings[0].Length = GetCurrentDirectoryW(MAX_PATH, (LPWSTR)Command->IncludePaths.Strings[0].Data);
 
 	BOOL CompilesToObj = FALSE;
 
@@ -727,7 +817,7 @@ static BOOL BuildCommandInfo(int argc, LPWSTR* argv, struct cl_command_info* Com
 					return FALSE;
 
 				if(*Flag == 'I'){
-					Command->IncludePaths[Command->IncludePathCount++] = StringFromWchar(Flag + 1);
+					Command->IncludePaths.Strings[Command->IncludePaths.Count++] = StringFromWchar(Flag + 1);
 					continue;
 				}
 			}else if(*Flag == 'F'){
@@ -766,7 +856,7 @@ static BOOL BuildCommandInfo(int argc, LPWSTR* argv, struct cl_command_info* Com
 		}
 
 		// Add flag to compiler command line so it can be hashed later
-		Command->CompilerFlags[Command->CompilerFlagCount++] = StringFromWchar(argv[i]);
+		Command->CompilerFlags.Strings[Command->CompilerFlags.Count++] = StringFromWchar(argv[i]);
 	}
 
 	if(Command->SrcFile.Length == 0 || Command->SrcFile.Length >= MAX_PATH)
@@ -803,16 +893,16 @@ static BOOL BuildCommandInfo(int argc, LPWSTR* argv, struct cl_command_info* Com
 	if(EnvVarLength > 0){
 		PopPartialMem(Arena, (MAX_COMMAND_LINE_LENGTH - EnvVarLength) * sizeof(WCHAR));
 
-		Command->SystemIncludePathCount = 1;
+		Command->SystemIncludePaths.Count = 1;
 
 		for(LPCWSTR c = EnvVarBuffer; *c; ++c){
 			if(*c == ';')
-				++Command->SystemIncludePathCount;
+				++Command->SystemIncludePaths.Count;
 		}
 
-		Command->SystemIncludePaths = PushMem(Arena, Command->SystemIncludePathCount * sizeof(struct string));
+		Command->SystemIncludePaths.Strings = PushMem(Arena, Command->SystemIncludePaths.Count * sizeof(struct string));
 
-		struct string* Path = Command->SystemIncludePaths;
+		struct string* Path = Command->SystemIncludePaths.Strings;
 		Path->Data = EnvVarBuffer;
 		Path->Length = 0;
 
@@ -896,38 +986,32 @@ static struct string ClVersionToString(UINT64 Version, struct string_buffer* Buf
 
 static LPWSTR BuildCommandLine(const struct cl_command_info* Command, struct memory_arena* Arena, struct string* CompilerFlags){
 	struct string_buffer CmdLineBuffer = MakeStringBuffer(PushMem(Arena, MAX_COMMAND_LINE_LENGTH * sizeof(WCHAR)), MAX_COMMAND_LINE_LENGTH);
-	PushCmdLineArg(Command->Executable, &CmdLineBuffer);
+	PushCmdLineArg(Command->Executable, STR(""), &CmdLineBuffer);
 
 	// Skip the first include path because that's the current directory which was added in BuildCommandInfo but shouldn't actually be passed to cl.exe
-	for(int i = 1; i < Command->IncludePathCount; ++i){
-		PushCmdLineArg(STR("\"/I"), &CmdLineBuffer);
-		PushString(Command->IncludePaths[i], &CmdLineBuffer);
-		PushString(STR("\""), &CmdLineBuffer);
-	}
+	for(int i = 1; i < Command->IncludePaths.Count; ++i)
+		PushCmdLineArg(STR("/I"), Command->IncludePaths.Strings[i], &CmdLineBuffer);
 
-	SortStrings(Command->CompilerFlags, Command->CompilerFlagCount);
+	SortStrings(Command->CompilerFlags);
 
-	*CompilerFlags = PushCmdLineArg(Command->CompilerFlags[0], &CmdLineBuffer); // There's always at least one compiler flag (/c)
+	size_t CompilerFlagsStart = CmdLineBuffer.Used;
+	CompilerFlags->Data = CmdLineBuffer.Data + CmdLineBuffer.Used;
 
-	for(int i = 1; i < Command->CompilerFlagCount; ++i)
-		CompilerFlags->Length += PushCmdLineArg(Command->CompilerFlags[i], &CmdLineBuffer).Length;
+	for(int i = 0; i < Command->CompilerFlags.Count; ++i)
+		PushCmdLineArg(Command->CompilerFlags.Strings[i], STR(""), &CmdLineBuffer);
+
+	CompilerFlags->Length = CmdLineBuffer.Used - CompilerFlagsStart;
 
 	if(Command->NoLogo)
-		PushCmdLineArg(STR("/nologo"), &CmdLineBuffer);
+		PushCmdLineArg(STR("/nologo"), STR(""), &CmdLineBuffer);
 
-	PushCmdLineArg(STR("/showIncludes"), &CmdLineBuffer); // showIncludes is always needed because the command output is parsed to get all included files
-	PushCmdLineArg(Command->SrcFile, &CmdLineBuffer);
-	PushCmdLineArg(STR("\"/Fo:"), &CmdLineBuffer);
-	PushString(Command->ObjFile, &CmdLineBuffer);
-	PushString(STR("\""), &CmdLineBuffer);
+	PushCmdLineArg(STR("/showIncludes"), STR(""), &CmdLineBuffer); // showIncludes is always needed because the command output is parsed to get all included files
+	PushCmdLineArg(Command->SrcFile, STR(""), &CmdLineBuffer);
+	PushCmdLineArg(STR("/Fo:"), Command->ObjFile, &CmdLineBuffer);
 
-	if(Command->GeneratesPdb){
-		ASSERT(Command->PdbFile.Length > 0);
-		PushCmdLineArg(STR("\"/Fd:"), &CmdLineBuffer);
-		PushString(Command->PdbFile, &CmdLineBuffer);
-	}
+	if(Command->GeneratesPdb)
+		PushCmdLineArg(STR("/Fd:"), Command->PdbFile, &CmdLineBuffer);
 
-	PushString(STR("\0"), &CmdLineBuffer);
 	PopPartialMem(Arena, CmdLineBuffer.Size - CmdLineBuffer.Used);
 
 	return CmdLineBuffer.Data;
@@ -944,7 +1028,7 @@ static struct string_buffer BuildCachePath(const struct cl_command_info* Command
 
 	// Build hash path using compiler version, source file hash and compiler command line hash
 
-	CopyMemory(PathBuffer.Data, GlobalConfig.CachePath, MAX_PATH * sizeof(WCHAR));
+	CopyMemory(PathBuffer.Data, g_Config.CachePath, MAX_PATH * sizeof(WCHAR));
 	PathBuffer.Used = lstrlenW(PathBuffer.Data);
 
 	if(PathBuffer.Data[PathBuffer.Used] != '\\')
@@ -964,18 +1048,18 @@ static struct dependency_info ReadDepFile(LPCWSTR Path, struct memory_arena* Are
 	HANDLE File = CreateFileW(Path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
 
 	if(File == INVALID_HANDLE_VALUE)
-		FatalError(STR("Unable to open dependency file for reading"), StringFromWchar(Path));
+		FatalError(CSTR("Failed to open dependency file for reading"));
 
 	LARGE_INTEGER FileSize;
 
 	if(!GetFileSizeEx(File, &FileSize))
-		FatalError(STR("Unable to determine file size"), StringFromWchar(Path));
+		FatalError(CSTR("Failed to determine file size"));
 
 	BYTE* Buffer = PushMem(Arena, FileSize.QuadPart);
 	DWORD NumBytesRead;
 
 	if(!ReadFile(File, Buffer, (DWORD)FileSize.QuadPart, &NumBytesRead, NULL))
-		FatalError(STR("Unable to read from dependency file"), StringFromWchar(Path));
+		FatalError(CSTR("Failed to read from dependency file"));
 
 	CloseHandle(File);
 
@@ -1034,21 +1118,18 @@ static void WriteDepFile(LPCWSTR Path, const struct dependency_info* Deps, struc
 	HANDLE File = CreateFileW(Path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
 
 	if(File == INVALID_HANDLE_VALUE)
-		FatalError(STR("Unable to open dependency file for writing"), StringFromWchar(Path));
+		FatalError(CSTR("Failed to open dependency file for writing"));
 
 	DWORD NumBytesWritten;
 
 	if(!WriteFile(File, Buffer, FileSize, &NumBytesWritten, NULL))
-		FatalError(STR("Unable to write to dependency file"), StringFromWchar(Path));
+		FatalError(CSTR("Failed to write to dependency file"));
 
 	CloseHandle(File);
 	PopMem(Arena);
 }
 
-static struct dependency_info GenerateDeps(const struct cl_command_info* Command, struct string CommandStdout, struct memory_arena* Arena){
-	UINT64 StrIndex = 0;
-	const struct string LineStart = STR("Note: including file:");
-
+static struct dependency_info GenerateDeps(const struct cl_command_info* Command, struct string_list IncludedFiles, struct memory_arena* Arena){
 	struct include_file{
 		struct include_file* Next;
 		struct string        IncludePath;
@@ -1061,48 +1142,49 @@ static struct dependency_info GenerateDeps(const struct cl_command_info* Command
 
 	Deps.EntryCount = 0;
 
-	while(StrIndex < CommandStdout.Length){
-		struct string Line = StringMid(CommandStdout, StrIndex, 0);
+	for(size_t FileIndex = 0; FileIndex < IncludedFiles.Count; ++FileIndex){
+		struct string IncludePath = STR("");
+		struct string FilePath = IncludedFiles.Strings[FileIndex];
+		BOOL FoundFile = FALSE;
 
-		while(StrIndex + Line.Length < CommandStdout.Length && Line.Data[Line.Length] != '\n')
-			++Line.Length;
+		for(int i = 0; i < Command->IncludePaths.Count; ++i){
+			if(StringStartsWithCaseInsensitive(FilePath, Command->IncludePaths.Strings[i])){
+				IncludePath = Command->IncludePaths.Strings[i];
+				FilePath = StringRight(FilePath, FilePath.Length - IncludePath.Length);
 
-		Line.Length += Line.Data[Line.Length] == '\n';
+				while(FilePath.Data[0] == '\\'){
+					++FilePath.Data;
+					--FilePath.Length;
+				}
 
-		if(StringStartsWith(Line, LineStart)){
-			struct string IncludePath = STR("");
-			struct string FilePath = TrimString(StringRight(Line, Line.Length - LineStart.Length));
-			BOOL FoundFile = FALSE;
+				FoundFile = TRUE;
+				break;
+			}
+		}
 
-			for(int i = 0; i < Command->IncludePathCount; ++i){
-				if(StringStartsWithCaseInsensitive(FilePath, Command->IncludePaths[i])){
-					IncludePath = Command->IncludePaths[i];
+		if(!FoundFile){
+			for(int i = 0; i < Command->SystemIncludePaths.Count; ++i){
+				if(StringStartsWithCaseInsensitive(FilePath, Command->SystemIncludePaths.Strings[i])){
+					IncludePath = Command->SystemIncludePaths.Strings[i];
 					FilePath = StringRight(FilePath, FilePath.Length - IncludePath.Length);
+
+					while(FilePath.Data[0] == '\\'){
+						++FilePath.Data;
+						--FilePath.Length;
+					}
+
 					FoundFile = TRUE;
 					break;
 				}
 			}
-
-			if(!FoundFile){
-				for(int i = 0; i < Command->SystemIncludePathCount; ++i){
-					if(StringStartsWithCaseInsensitive(FilePath, Command->SystemIncludePaths[i])){
-						IncludePath = Command->SystemIncludePaths[i];
-						FilePath = StringRight(FilePath, FilePath.Length - IncludePath.Length);
-						FoundFile = TRUE;
-						break;
-					}
-				}
-			}
-
-			*Temp = PushMem(Arena, sizeof(struct include_file));
-			(*Temp)->IncludePath = IncludePath;
-			(*Temp)->FileName = FilePath;
-			(*Temp)->Next = NULL;
-			Temp = &(*Temp)->Next;
-			++Deps.EntryCount;
 		}
 
-		StrIndex += Line.Length;
+		*Temp = PushMem(Arena, sizeof(struct include_file));
+		(*Temp)->IncludePath = IncludePath;
+		(*Temp)->FileName = FilePath;
+		(*Temp)->Next = NULL;
+		Temp = &(*Temp)->Next;
+		++Deps.EntryCount;
 	}
 
 	Deps.Entries = PushMem(Arena, Deps.EntryCount * sizeof(struct dependency_entry));
@@ -1110,14 +1192,17 @@ static struct dependency_info GenerateDeps(const struct cl_command_info* Command
 	struct include_file* Inc = First;
 
 	for(UINT32 i = 0; i < Deps.EntryCount; ++i){
-		WCHAR TempPath[MAX_PATH];
+		WCHAR PathBufferData[MAX_PATH];
+		struct string_buffer PathBuffer = MakeStringBuffer(PathBufferData, ARRAYSIZE(PathBufferData));
 
-		CopyMemory(TempPath, Inc->IncludePath.Data, Inc->IncludePath.Length * sizeof(WCHAR));
-		CopyMemory(&TempPath[Inc->IncludePath.Length], Inc->FileName.Data, Inc->FileName.Length * sizeof(WCHAR));
-		TempPath[Inc->IncludePath.Length + Inc->FileName.Length] = '\0';
+		PushString(Inc->IncludePath, &PathBuffer);
 
-		GetFileSizeLastModified(TempPath, &Deps.Entries[i].Size, &Deps.Entries[i].LastModified);
-		Deps.Entries[i].Hash = HashFileContent(TempPath, Arena);
+		if(Inc->IncludePath.Length > 0 && Inc->IncludePath.Data[Inc->IncludePath.Length - 1] != '\\')
+			PushString(STR("\\"), &PathBuffer);
+
+		PushString(Inc->FileName, &PathBuffer);
+		GetFileSizeLastModified(PathBuffer.Data, &Deps.Entries[i].Size, &Deps.Entries[i].LastModified);
+		Deps.Entries[i].Hash = HashFileContent(PathBuffer.Data, Arena);
 		Deps.Entries[i].FileName = Inc->FileName;
 		Inc = Inc->Next;
 	}
@@ -1147,12 +1232,12 @@ static BOOL CacheUpToDate(const struct cl_command_info* Command, struct string_b
 		struct string FileName = Deps.Entries[i].FileName;
 		BOOL FoundFile = FALSE;
 
-		for(int j = 0; j < Command->IncludePathCount; ++j){
-			if(Command->IncludePaths[j].Length + FileName.Length + 2 >= MAX_PATH)
+		for(int j = 0; j < Command->IncludePaths.Count; ++j){
+			if(Command->IncludePaths.Strings[j].Length + FileName.Length + 2 >= MAX_PATH)
 				continue;
 
 			TempBuffer.Used = 0;
-			PushString(Command->IncludePaths[j], &TempBuffer);
+			PushString(Command->IncludePaths.Strings[j], &TempBuffer);
 			PushString(STR("\\"), &TempBuffer);
 			PushString(FileName, &TempBuffer);
 			TempBufferData[TempBuffer.Used] = '\0';
@@ -1164,12 +1249,12 @@ static BOOL CacheUpToDate(const struct cl_command_info* Command, struct string_b
 		}
 
 		if(!FoundFile){
-			for(int j = 0; j < Command->SystemIncludePathCount; ++j){
-				if(Command->SystemIncludePaths[j].Length + FileName.Length + 2 >= MAX_PATH)
+			for(int j = 0; j < Command->SystemIncludePaths.Count; ++j){
+				if(Command->SystemIncludePaths.Strings[j].Length + FileName.Length + 2 >= MAX_PATH)
 					continue;
 
 				TempBuffer.Used = 0;
-				PushString(Command->SystemIncludePaths[j], &TempBuffer);
+				PushString(Command->SystemIncludePaths.Strings[j], &TempBuffer);
 				PushString(STR("\\"), &TempBuffer);
 				PushString(FileName, &TempBuffer);
 				TempBufferData[TempBuffer.Used] = '\0';
@@ -1201,12 +1286,12 @@ static BOOL CacheUpToDate(const struct cl_command_info* Command, struct string_b
 
 static struct string ReadUtf8FileToString(HANDLE File, struct memory_arena* Arena){
 	if(SetFilePointer(File, 0, NULL, FILE_BEGIN) == INVALID_SET_FILE_POINTER)
-		FatalError(STR("Unable to read compiler output file"), STR(""));
+		FatalError(CSTR("Failed to read compiler output file"));
 
 	LARGE_INTEGER FileSize;
 
 	if(!GetFileSizeEx(File, &FileSize))
-		FatalError(STR("Unable to read compiler output file"), STR(""));
+		FatalError(CSTR("Failed to read compiler output file"));
 
 	LPWSTR StringData = PushMem(Arena, FileSize.QuadPart * sizeof(WCHAR));
 	size_t ArenaPrevUsed = Arena->Used;
@@ -1215,7 +1300,7 @@ static struct string ReadUtf8FileToString(HANDLE File, struct memory_arena* Aren
 	DWORD NumBytesRead;
 
 	if(!ReadFile(File, Utf8Buffer, (DWORD)FileSize.QuadPart, &NumBytesRead, NULL))
-		FatalError(STR("Unable to read compiler output file"), STR(""));
+		FatalError(CSTR("Failed to read compiler output file"));
 
 	StringLength = (size_t)MultiByteToWideChar(CP_UTF8, 0, Utf8Buffer, (int)FileSize.QuadPart, StringData, (int)FileSize.QuadPart);
 	PopMem(Arena);
@@ -1224,12 +1309,39 @@ static struct string ReadUtf8FileToString(HANDLE File, struct memory_arena* Aren
 	return MakeString(StringData, StringLength);
 }
 
+static void ExtractIncludedFilesFromCompilerOutput(struct string Text, struct memory_arena* Arena, struct string_list* IncludedFiles, struct string* Output){
+	const struct string IncludeLineStart = STR("Note: including file:");
+	struct string_list List = SplitString(Text, '\n', Arena);
+	WCHAR* OutputBufferData = PushMem(Arena, (Text.Length + 1) * sizeof(WCHAR));
+	struct string_buffer OutputBuffer = MakeStringBuffer(OutputBufferData, Text.Length + 1);
+	struct string* Current = List.Strings;
+	size_t FileCount = 0;
+
+	for(size_t i = 0; i < List.Count; ++i){
+		const struct string Line = List.Strings[i];
+
+		if(StringStartsWith(List.Strings[i], IncludeLineStart)){
+			*Current = TrimString(StringRight(Line, Line.Length - IncludeLineStart.Length));
+			++Current;
+			++FileCount;
+		}else{
+			// Include the newline in the pushed string
+			PushString(MakeString(Line.Data, Line.Length + 1), &OutputBuffer);
+		}
+	}
+
+	List.Count= FileCount;
+	*IncludedFiles = List;
+	*Output = MakeString(OutputBuffer.Data, OutputBuffer.Used);
+	PopPartialMem(Arena, OutputBuffer.Size - OutputBuffer.Used);
+}
+
 static int InvokeCompiler(LPWSTR CmdLine, const struct cl_command_info* Command, struct string_buffer* CachePathBuffer, struct memory_arena* Arena){
 	WCHAR StdoutTempFileName[MAX_PATH];
 	WCHAR StderrTempFileName[MAX_PATH];
 
-	GetTempFileNameW(L".", L"err", 0, StdoutTempFileName);
-	GetTempFileNameW(L".", L"out", 0, StderrTempFileName);
+	GetTempFileNameW(L".", L"out", 0, StdoutTempFileName);
+	GetTempFileNameW(L".", L"err", 0, StderrTempFileName);
 
 	SECURITY_ATTRIBUTES SecurityAttributes;
 	SecurityAttributes.nLength = sizeof(SecurityAttributes);
@@ -1237,98 +1349,127 @@ static int InvokeCompiler(LPWSTR CmdLine, const struct cl_command_info* Command,
 	SecurityAttributes.bInheritHandle = TRUE;
 
 	HANDLE StdoutFile = CreateFileW(StdoutTempFileName,
-																	GENERIC_READ | GENERIC_WRITE,
-																	FILE_SHARE_READ | FILE_SHARE_WRITE,
-																	&SecurityAttributes,
-																	OPEN_ALWAYS,
-																	FILE_ATTRIBUTE_NORMAL,
-																	NULL);
+	                                GENERIC_READ | GENERIC_WRITE,
+	                                FILE_SHARE_READ | FILE_SHARE_WRITE,
+	                                &SecurityAttributes,
+	                                OPEN_ALWAYS,
+	                                FILE_ATTRIBUTE_NORMAL,
+	                                NULL);
 	HANDLE StderrFile = CreateFileW(StderrTempFileName,
-																	GENERIC_READ | GENERIC_WRITE,
-																	FILE_SHARE_READ | FILE_SHARE_WRITE,
-																	&SecurityAttributes,
-																	OPEN_ALWAYS,
-																	FILE_ATTRIBUTE_NORMAL,
-																	NULL);
+	                                GENERIC_READ | GENERIC_WRITE,
+	                                FILE_SHARE_READ | FILE_SHARE_WRITE,
+	                                &SecurityAttributes,
+	                                OPEN_ALWAYS,
+	                                FILE_ATTRIBUTE_NORMAL,
+	                                NULL);
 	PROCESS_INFORMATION Process;
 
-	StartProcess(CmdLine, &Process, StdoutFile, StderrFile);
-
-	size_t CachePathLength = CachePathBuffer->Used;
-	MakePath(MakeString(CachePathBuffer->Data, CachePathBuffer->Used));
+	StartProcess(CmdLine, &Process, FALSE, StdoutFile, StderrFile);
 
 	int ExitCode = (int)WaitForProcessToFinish(&Process);
 
-	// Generate dependency file
+	struct string StdoutString = ReadUtf8FileToString(StdoutFile, Arena);
+	CloseHandle(StdoutFile);
+	DeleteFileW(StdoutTempFileName);
 
 	{
-		struct string StdoutString = ReadUtf8FileToString(StdoutFile, Arena);
-		size_t ArenaPrevUsed = Arena->PrevUsed;
-		struct dependency_info Deps = GenerateDeps(Command, StdoutString, Arena);
-		CachePathBuffer->Used = CachePathLength;
-		PushString(STR("dep"), CachePathBuffer);
-		WriteDepFile(CachePathBuffer->Data, &Deps, Arena);
-		Arena->PrevUsed = ArenaPrevUsed;
-		PopMem(Arena);
-	}
+		// Remove name of source file from first line of stdout because it is printed elsewhere
+		struct string SrcFileName = FileNameWithoutPath(Command->SrcFile);
 
-	// Write stderr to console and file
-
-	{
-		struct string StderrString = ReadUtf8FileToString(StderrFile, Arena);
-
-		if(StderrString.Length > 0){
-			WriteStderr(StderrString);
-			CachePathBuffer->Used = CachePathLength;
-			PushString(STR("err"), CachePathBuffer);
-			WriteDataToFile(CachePathBuffer->Data, StderrString.Data, StderrString.Length * sizeof(WCHAR));
-			PopMem(Arena);
+		if(StringStartsWith(StdoutString, SrcFileName)){
+			StdoutString.Data += SrcFileName.Length;
+			StdoutString.Length -= SrcFileName.Length;
+			StdoutString = TrimStringLeft(StdoutString);
 		}
 	}
 
-	WCHAR TempPath[MAX_PATH];
+	struct cstring StderrContent;
+	StderrContent.Data = ReadDataFromFileHandle(StderrFile, Arena, &StderrContent.Length);
+	CloseHandle(StderrFile);
+	DeleteFileW(StderrTempFileName);
 
-	// Copy obj to cache
+	struct string_list IncludedFiles;
+	ExtractIncludedFilesFromCompilerOutput(StdoutString, Arena, &IncludedFiles, &StdoutString);
 
-	CopyMemory(TempPath, Command->ObjFile.Data, Command->ObjFile.Length * sizeof(WCHAR));
-	TempPath[Command->ObjFile.Length] = '\0';
-	CachePathBuffer->Used = CachePathLength;
-	PushString(STR("obj"), CachePathBuffer);
-	CopyFileW(TempPath, CachePathBuffer->Data, FALSE);
+	LPSTR StdoutBuffer = PushMem(Arena, StdoutString.Length * 2);
+	WideCharToMultiByte(CP_UTF8, 0, StdoutString.Data, (int)StdoutString.Length, StdoutBuffer, (int)StdoutString.Length * 2, NULL, FALSE);
+	struct cstring StdoutContent = StringFromChar(StdoutBuffer);
 
-	// Copy pdb to cache
-
-	if(Command->GeneratesPdb){
-		CopyMemory(TempPath, Command->PdbFile.Data, Command->PdbFile.Length * sizeof(WCHAR));
-		TempPath[Command->PdbFile.Length] = '\0';
-		CachePathBuffer->Used = CachePathLength;
-		PushString(STR("pdb"), CachePathBuffer);
-		CopyFileW(TempPath, CachePathBuffer->Data, FALSE);
+	if(StdoutString.Length > 0){
+		if(g_Config.UseStderr)
+			WriteStderr(StdoutContent);
+		else
+			WriteStdout(StdoutContent);
 	}
 
-	// Close handles and delete temporary files
+	if(StderrContent.Length > 0)
+		WriteStderr(StderrContent);
 
-	CloseHandle(StdoutFile);
-	CloseHandle(StderrFile);
-	DeleteFileW(StdoutTempFileName);
-	DeleteFileW(StderrTempFileName);
+	if(ExitCode == 0){
+		WCHAR TempPath[MAX_PATH];
+
+		size_t CachePathLength = CachePathBuffer->Used;
+		MakePath(MakeString(CachePathBuffer->Data, CachePathBuffer->Used));
+
+		// Generate dep file
+
+		struct dependency_info Deps = GenerateDeps(Command, IncludedFiles, Arena);
+		CachePathBuffer->Used = CachePathLength;
+		PushString(STR("dep"), CachePathBuffer);
+		WriteDepFile(CachePathBuffer->Data, &Deps, Arena);
+
+		// Write stdout to file
+
+		if(StdoutString.Length > 0){
+			CachePathBuffer->Used = CachePathLength;
+			PushString(STR("out"), CachePathBuffer);
+			WriteDataToFile(CachePathBuffer->Data, StdoutString.Data, StdoutString.Length);
+		}
+
+		// Write stderr to file
+
+		if(StderrContent.Length > 0){
+			CachePathBuffer->Used = CachePathLength;
+			PushString(STR("err"), CachePathBuffer);
+			WriteDataToFile(CachePathBuffer->Data, StderrContent.Data, StderrContent.Length);
+		}
+
+		// Copy obj to cache
+
+		CopyMemory(TempPath, Command->ObjFile.Data, Command->ObjFile.Length * sizeof(WCHAR));
+		TempPath[Command->ObjFile.Length] = '\0';
+		CachePathBuffer->Used = CachePathLength;
+		PushString(STR("obj"), CachePathBuffer);
+		CopyFileW(TempPath, CachePathBuffer->Data, FALSE);
+
+		// Copy pdb to cache
+
+		if(Command->GeneratesPdb){
+			CopyMemory(TempPath, Command->PdbFile.Data, Command->PdbFile.Length * sizeof(WCHAR));
+			TempPath[Command->PdbFile.Length] = '\0';
+			CachePathBuffer->Used = CachePathLength;
+			PushString(STR("pdb"), CachePathBuffer);
+			CopyFileW(TempPath, CachePathBuffer->Data, FALSE);
+		}
+	}
 
 	return ExitCode;
 }
 
 static int CacheMain(int argc, LPWSTR* argv){
 	if(!StringsAreEqual(FileNameWithoutPath(StringFromWchar(argv[1])), STR("cl.exe"))){
-		WriteStderr(STR("ERROR: First argument is expected to be the path to cl.exe"));
-
+		WriteStderr(CSTR("ERROR: First argument is expected to be the path to cl.exe"));
 		return 1;
 	}
 
 	struct cl_command_info Command;
-	struct memory_arena Arena = CreateMemory(GIGABYTES(1));
+	struct memory_arena Arena = CreateMemory(MEGABYTES(128));
 
 	if(BuildCommandInfo(argc, argv, &Command, &Arena)){
-		WriteStdout(Command.SrcFile);
+#if 0
+		WriteStdout(FileNameWithoutPath(Command.SrcFile));
 		WriteStdout(STR("\n"));
+#endif
 
 		struct string CompilerFlags;
 		LPWSTR CmdLine = BuildCommandLine(&Command, &Arena, &CompilerFlags);
@@ -1345,11 +1486,13 @@ static int CacheMain(int argc, LPWSTR* argv){
 			TempPath[Command.ObjFile.Length] = '\0';
 
 			if(!CopyFileW(CachePathBuffer.Data, TempPath, FALSE)){
-				WriteStderr(STR("Unable to copy cached obj file to destination: "));
+				WriteStderr(CSTR("Failed to copy cached obj file to destination: "));
+#if 0
 				WriteStderr(MakeString(CachePathBuffer.Data, CachePathBuffer.Used));
 				WriteStderr(STR(" -> "));
 				WriteStderr(StringFromWchar(TempPath));
 				WriteStderr(STR("\n"));
+#endif
 				CachePathBuffer.Used = CachePathLength;
 				return InvokeCompiler(CmdLine, &Command, &CachePathBuffer, &Arena);
 			}
@@ -1362,28 +1505,54 @@ static int CacheMain(int argc, LPWSTR* argv){
 				PushString(STR("pdb"), &CachePathBuffer);
 
 				if(!CopyFileW(CachePathBuffer.Data, TempPath, FALSE)){
-					WriteStderr(STR("Unable to copy cached pdb file to destination: "));
+					WriteStderr(CSTR("Failed to copy cached pdb file to destination: "));
+#if 0
 					WriteStderr(MakeString(CachePathBuffer.Data, CachePathBuffer.Used));
 					WriteStderr(STR(" -> "));
 					WriteStderr(StringFromWchar(TempPath));
 					WriteStderr(STR("\n"));
+#endif
 					CachePathBuffer.Used = CachePathLength;
 					return InvokeCompiler(CmdLine, &Command, &CachePathBuffer, &Arena);
 				}
 			}
 
-			CachePathBuffer.Used = CachePathLength;
-			PushString(STR("err"), &CachePathBuffer);
 			LPCWSTR FilePath = CachePathBuffer.Data;
 			UINT64 FileSize;
 			UINT64 FileLastModified;
 
-			// Most of the time the stderr file is emtpy
-			if(GetFileSizeLastModified(FilePath, &FileSize, &FileLastModified) && FileSize > 0){
-				UINT64 Size;
-				LPCWSTR Data = ReadDataFromFile(FilePath, &Arena, &Size);
-				WriteStderr(MakeString(Data, Size / sizeof(WCHAR)));
-				PopMem(&Arena);
+			// Write stdout
+			{
+				CachePathBuffer.Used = CachePathLength;
+				PushString(STR("out"), &CachePathBuffer);
+
+				// Most of the time the stderr file is emtpy
+				if(GetFileSizeLastModified(FilePath, &FileSize, &FileLastModified) && FileSize > 0){
+					size_t Size;
+					const char* Data = ReadDataFromFile(FilePath, &Arena, &Size);
+					struct cstring Out = MakeCString(Data, Size);
+
+					if(g_Config.UseStderr)
+						WriteStderr(Out);
+					else
+						WriteStdout(Out);
+
+					PopMem(&Arena);
+				}
+			}
+
+			// Write stderr
+			{
+				CachePathBuffer.Used = CachePathLength;
+				PushString(STR("err"), &CachePathBuffer);
+
+				// Most of the time the stderr file is emtpy
+				if(GetFileSizeLastModified(FilePath, &FileSize, &FileLastModified) && FileSize > 0){
+					size_t Size;
+					const char* Data = ReadDataFromFile(FilePath, &Arena, &Size);
+					WriteStderr(MakeCString(Data, Size));
+					PopMem(&Arena);
+				}
 			}
 
 			return 0;
@@ -1415,7 +1584,7 @@ static int CacheMain(int argc, LPWSTR* argv){
 
 		PROCESS_INFORMATION Process;
 
-		StartProcess(CmdLine, &Process, INVALID_HANDLE_VALUE, INVALID_HANDLE_VALUE);
+		StartProcess(CmdLine, &Process, FALSE, INVALID_HANDLE_VALUE, INVALID_HANDLE_VALUE);
 
 		return (int)WaitForProcessToFinish(&Process);
 	}
@@ -1426,12 +1595,13 @@ static int CacheMain(int argc, LPWSTR* argv){
  */
 
 static void PrintHelpText(void){
-	WriteStdout(STR(
+	WriteStdout(CSTR(
 		"Available options:\n"
 		" -h      show this help\n"
 		" -i      show info\n"
 		" -m<n>   set maximum cache size to n gigabytes\n"
 		" -p<dir> set cache path to <dir>\\.clcache\n"
+		" -e<1/0> enable or disable redirection of errors to stderr\n"
 	));
 }
 
@@ -1442,15 +1612,15 @@ int mainCRTStartup(){
 #else
 int wmain(int argc, LPWSTR* argv){
 #endif
-	StdoutHandle = GetStdHandle(STD_OUTPUT_HANDLE);
-	StderrHandle = GetStdHandle(STD_ERROR_HANDLE);
+	g_StdoutHandle = GetStdHandle(STD_OUTPUT_HANDLE);
+	g_StderrHandle = GetStdHandle(STD_ERROR_HANDLE);
 
 	if(argc <= 1){
-		WriteStderr(STR(
+		WriteStderr(CSTR(
 			"Usage:\n"
 			"    clcache.exe <path_to_cl.exe> <cl_args>\n"
 			"  or\n"
-			"    clcache.exe <options> # -h for a list of available options\n"
+			"    clcache.exe <options> (-h for a list of available options)\n"
 		));
 
 		ExitProcess(1);
@@ -1460,20 +1630,20 @@ int wmain(int argc, LPWSTR* argv){
 	{
 		PWSTR LocalAppData;
 
-		ConfigFilePath[0] = '\0';
+		g_ConfigFilePath[0] = '\0';
 		SHGetKnownFolderPath(&FOLDERID_LocalAppData, 0, NULL, &LocalAppData);
-		lstrcpyW(ConfigFilePath, LocalAppData);
+		lstrcpyW(g_ConfigFilePath, LocalAppData);
 		// CoTaskMemFree(LocalAppData);
-		lstrcatW(ConfigFilePath, L"\\clcache");
-		MakePath(StringFromWchar(ConfigFilePath));
-		lstrcatW(ConfigFilePath, L"\\cache.config");
+		lstrcatW(g_ConfigFilePath, L"\\clcache");
+		MakePath(StringFromWchar(g_ConfigFilePath));
+		lstrcatW(g_ConfigFilePath, L"\\clcache.config");
 	}
 
-	ReadConfig(&GlobalConfig);
+	ReadConfig(&g_Config);
 
 	if(*argv[1] == '-'){
 		for(int i = 1; i < argc; ++i){
-			LPWSTR Arg = argv[i] + 1;
+			LPCWSTR Arg = argv[i] + 1;
 
 			switch(*Arg){
 			case 'h':
@@ -1481,17 +1651,18 @@ int wmain(int argc, LPWSTR* argv){
 				break;
 			case 'i':
 				{
-					WriteStdout(STR("Configuration: "));
-					WriteStdout(StringFromWchar(ConfigFilePath));
-					WriteStdout(STR("\nCache path:    "));
-					WriteStdout(StringFromWchar(GlobalConfig.CachePath));
-					WriteStdout(STR("\nCache size:    "));
+					char Buffer[MAX_PATH];
 
-					WCHAR BufferData[20]; // 20 chars is the max length for a UINT64
-					struct string_buffer Buffer = MakeStringBuffer(BufferData, ARRAYSIZE(BufferData));
-
-					WriteStdout(UINT64ToString(GlobalConfig.CacheSize / GIGABYTES(1), &Buffer));
-					WriteStdout(STR(" GB\n"));
+					WriteStdout(CSTR("Configuration:   "));
+					WideCharToMultiByte(CP_UTF8, 0, g_ConfigFilePath, -1, Buffer, ARRAYSIZE(Buffer), NULL, FALSE);
+					WriteStdout(StringFromChar(Buffer));
+					WriteStdout(CSTR("\nCache path:      "));
+					WideCharToMultiByte(CP_UTF8, 0, g_Config.CachePath, -1, Buffer, ARRAYSIZE(Buffer), NULL, FALSE);
+					WriteStdout(StringFromChar(Buffer));
+					WriteStdout(CSTR("\nMax cache size:  "));
+					WriteStdout(UINT64ToCString(g_Config.CacheSize / GIGABYTES(1), Buffer));
+					WriteStdout(CSTR(" GB\nErrors:          "));
+					WriteStdout(g_Config.UseStderr ? CSTR("redirected to stderr\n") : CSTR("stdout (cl.exe default)\n"));
 					break;
 				}
 			case 'm':
@@ -1502,19 +1673,17 @@ int wmain(int argc, LPWSTR* argv){
 							Arg = argv[++i];
 
 					if(!IsDigit(*Arg)){
-						WriteStderr(STR("The -m option expects a number in gigabytes"));
-
+						WriteStderr(CSTR("The -m option expects a number in gigabytes"));
 						ExitProcess(1);
 					}
 
 					UINT64 NewCacheSize = StringToUINT64(StringFromWchar(Arg));
 
 					if(NewCacheSize >= 1){
-						GlobalConfig.CacheSize = GIGABYTES(NewCacheSize); // TODO: Clean up the cache if necessary
-						WriteConfig(&GlobalConfig);
+						g_Config.CacheSize = GIGABYTES(NewCacheSize); // TODO: Clean up the cache if necessary
+						WriteConfig(&g_Config);
 					}else{
-						WriteStderr(STR("ERROR: Cache size must be at least 1 gigabyte"));
-
+						WriteStderr(CSTR("ERROR: Cache size must be at least 1 gigabyte"));
 						ExitProcess(1);
 					}
 				}
@@ -1528,44 +1697,39 @@ int wmain(int argc, LPWSTR* argv){
 						Arg = argv[++i];
 
 					if(*Arg == '\0' || *Arg == '-'){
-						WriteStderr(STR("ERROR: the -p option expects a path as an argument"));
-
+						WriteStderr(CSTR("ERROR: the -p option expects a path as an argument"));
 						ExitProcess(1);
 					}
 
 					WCHAR Buffer[MAX_PATH];
-
-					while(*Arg == ' ' || *Arg == '\t')
-						++Arg;
-
 					DWORD PathLength = GetFullPathNameW(Arg, MAX_PATH, Buffer, NULL);
 
 					if(PathLength + CACHE_PATH_LENGTH >= MAX_PATH || PathLength == 0){
-						WriteStderr(STR("Invalid cache path"));
-
+						WriteStderr(CSTR("Invalid cache path"));
 						ExitProcess(1);
 					}
 
-					Arg = Buffer + lstrlenW(Buffer);
+					WCHAR* Temp = Buffer + lstrlenW(Buffer);
 
-					while(Arg != Buffer && IsPathSeparator(*(Arg - 1))){ // Remove trailing path separators
-						--Arg;
-						*Arg = '\0';
+					while(Temp != Buffer && IsPathSeparator(*(Temp - 1))){ // Remove trailing path separators
+						--Temp;
+						*Temp = '\0';
 					}
 
 					if(!StringEndsWith(StringFromWchar(Buffer), STR("\\.clcache")))
 						lstrcatW(Buffer, L"\\.clcache");
 
-					lstrcpyW(GlobalConfig.CachePath, Buffer);
-					WriteConfig(&GlobalConfig);
+					lstrcpyW(g_Config.CachePath, Buffer);
+					WriteConfig(&g_Config);
 				}
 
 				break;
+			case 'e':
+				g_Config.UseStderr = Arg[1] == '1';
+				WriteConfig(&g_Config);
+				break;
 			default:
-				WriteStderr(STR("Unknown option: "));
-				WriteStderr(StringFromWchar(argv[i]));
-				WriteStderr(STR("\n"));
-
+				WriteStderr(CSTR("Unknown option\n"));
 				ExitProcess(1);
 			}
 		}
