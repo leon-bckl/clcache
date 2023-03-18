@@ -112,6 +112,7 @@ struct cl_command_info{
 	struct string SrcFile;
 	struct string_list CompilerFlags;
 	struct string_list IncludePaths;
+	struct string_list ExternalIncludePaths;
 	struct string_list SystemIncludePaths;
 };
 
@@ -803,6 +804,9 @@ static BOOL BuildCommandInfo(int argc, LPWSTR* argv, struct cl_command_info* Com
 	Command->IncludePaths.Strings[0].Data = PushMem(Arena, MAX_PATH);
 	Command->IncludePaths.Strings[0].Length = GetCurrentDirectoryW(MAX_PATH, (LPWSTR)Command->IncludePaths.Strings[0].Data);
 
+	Command->ExternalIncludePaths.Count = 0;
+	Command->ExternalIncludePaths.Strings = PushMem(Arena, argc * sizeof(struct string));
+
 	BOOL CompilesToObj = FALSE;
 
 	for(int i = 2; i < argc; ++i){
@@ -812,12 +816,27 @@ static BOOL BuildCommandInfo(int argc, LPWSTR* argv, struct cl_command_info* Com
 			if(IsLinkerFlag(Flag))
 				return FALSE;
 
+			BOOL External = FALSE;
+
+			if(lstrcmpW(Flag, L"external:") == 0){
+				Flag += sizeof("external:") + 1;
+
+				while(IsWhitespace(*Flag))
+					++Flag;
+
+				External = TRUE;
+			}
+
 			if(IsPreprocessorFlag(Flag)){
 				if(*Flag == 'E' || *Flag == 'P') // Only preprocessor, no compilation so nothing to cache...
 					return FALSE;
 
 				if(*Flag == 'I'){
-					Command->IncludePaths.Strings[Command->IncludePaths.Count++] = StringFromWchar(Flag + 1);
+					if(External)
+						Command->ExternalIncludePaths.Strings[Command->ExternalIncludePaths.Count++] = StringFromWchar(Flag + 1);
+					else
+						Command->IncludePaths.Strings[Command->IncludePaths.Count++] = StringFromWchar(Flag + 1);
+
 					continue;
 				}
 			}else if(*Flag == 'F'){
@@ -892,30 +911,7 @@ static BOOL BuildCommandInfo(int argc, LPWSTR* argv, struct cl_command_info* Com
 
 	if(EnvVarLength > 0){
 		PopPartialMem(Arena, (MAX_COMMAND_LINE_LENGTH - EnvVarLength) * sizeof(WCHAR));
-
-		Command->SystemIncludePaths.Count = 1;
-
-		for(LPCWSTR c = EnvVarBuffer; *c; ++c){
-			if(*c == ';')
-				++Command->SystemIncludePaths.Count;
-		}
-
-		Command->SystemIncludePaths.Strings = PushMem(Arena, Command->SystemIncludePaths.Count * sizeof(struct string));
-
-		struct string* Path = Command->SystemIncludePaths.Strings;
-		Path->Data = EnvVarBuffer;
-		Path->Length = 0;
-
-		for(LPCWSTR c = EnvVarBuffer; *c; ++c){
-			if(*c == ';'){
-				++Path;
-				Path->Data = c + 1;
-				Path->Length = 0;
-				continue;
-			}
-
-			++Path->Length;
-		}
+		Command->SystemIncludePaths = SplitString(StringFromWchar(EnvVarBuffer), ';', Arena);
 	}else{
 		PopMem(Arena);
 	}
@@ -991,6 +987,9 @@ static LPWSTR BuildCommandLine(const struct cl_command_info* Command, struct mem
 	// Skip the first include path because that's the current directory which was added in BuildCommandInfo but shouldn't actually be passed to cl.exe
 	for(int i = 1; i < Command->IncludePaths.Count; ++i)
 		PushCmdLineArg(STR("/I"), Command->IncludePaths.Strings[i], &CmdLineBuffer);
+
+	for(int i = 0; i < Command->ExternalIncludePaths.Count; ++i)
+		PushCmdLineArg(STR("/external:I"), Command->ExternalIncludePaths.Strings[i], &CmdLineBuffer);
 
 	SortStrings(Command->CompilerFlags);
 
@@ -1129,6 +1128,15 @@ static void WriteDepFile(LPCWSTR Path, const struct dependency_info* Deps, struc
 	PopMem(Arena);
 }
 
+static int FindIncludePathFromFile(struct string_list IncludePaths, struct string FilePath){
+	for(int i = 0; i < IncludePaths.Count; ++i){
+		if(StringStartsWithCaseInsensitive(FilePath, IncludePaths.Strings[i]))
+			return i;
+	}
+
+	return -1;
+}
+
 static struct dependency_info GenerateDeps(const struct cl_command_info* Command, struct string_list IncludedFiles, struct memory_arena* Arena){
 	struct include_file{
 		struct include_file* Next;
@@ -1145,37 +1153,32 @@ static struct dependency_info GenerateDeps(const struct cl_command_info* Command
 	for(size_t FileIndex = 0; FileIndex < IncludedFiles.Count; ++FileIndex){
 		struct string IncludePath = STR("");
 		struct string FilePath = IncludedFiles.Strings[FileIndex];
-		BOOL FoundFile = FALSE;
+		struct string* FoundIncludePath = NULL;
 
-		for(int i = 0; i < Command->IncludePaths.Count; ++i){
-			if(StringStartsWithCaseInsensitive(FilePath, Command->IncludePaths.Strings[i])){
-				IncludePath = Command->IncludePaths.Strings[i];
-				FilePath = StringRight(FilePath, FilePath.Length - IncludePath.Length);
+		int Index = FindIncludePathFromFile(Command->IncludePaths, FilePath);
 
-				while(FilePath.Data[0] == '\\'){
-					++FilePath.Data;
-					--FilePath.Length;
-				}
+		if(Index >= 0){
+			FoundIncludePath = Command->IncludePaths.Strings + Index;
+		}else{
+			Index = FindIncludePathFromFile(Command->ExternalIncludePaths, FilePath);
 
-				FoundFile = TRUE;
-				break;
+			if(Index >= 0){
+				FoundIncludePath = Command->ExternalIncludePaths.Strings + Index;
+			}else{
+				Index = FindIncludePathFromFile(Command->SystemIncludePaths, FilePath);
+
+				if(Index >= 0)
+					FoundIncludePath = Command->SystemIncludePaths.Strings + Index;
 			}
 		}
 
-		if(!FoundFile){
-			for(int i = 0; i < Command->SystemIncludePaths.Count; ++i){
-				if(StringStartsWithCaseInsensitive(FilePath, Command->SystemIncludePaths.Strings[i])){
-					IncludePath = Command->SystemIncludePaths.Strings[i];
-					FilePath = StringRight(FilePath, FilePath.Length - IncludePath.Length);
+		if(FoundIncludePath){
+			IncludePath = *FoundIncludePath;
+			FilePath = StringRight(FilePath, FilePath.Length - IncludePath.Length);
 
-					while(FilePath.Data[0] == '\\'){
-						++FilePath.Data;
-						--FilePath.Length;
-					}
-
-					FoundFile = TRUE;
-					break;
-				}
+			while(FilePath.Data[0] == '\\'){
+				++FilePath.Data;
+				--FilePath.Length;
 			}
 		}
 
