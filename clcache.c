@@ -86,10 +86,10 @@ struct string_buffer{
 };
 
 struct index_hash{
-	int* HashIndices;
-	int* Indices;
-	unsigned int  HashCount;
-	unsigned int  IndexCount;
+	int*         HashIndices;
+	int*         Indices;
+	unsigned int HashCount;
+	unsigned int IndexCount;
 };
 
 struct cache_config{
@@ -1042,7 +1042,7 @@ static BOOL BuildCommandInfo(int argc, LPWSTR* argv, struct cl_command_info* Com
 
 	if(EnvVarLength > 0){
 		PopPartialMem(Arena, (MAX_COMMAND_LINE_LENGTH - EnvVarLength) * sizeof(WCHAR));
-		Command->SystemIncludePaths = SplitString(StringFromWchar(EnvVarBuffer), ';', Arena);
+		Command->SystemIncludePaths = SplitString(MakeString(EnvVarBuffer, EnvVarLength), ';', Arena);
 	}else{
 		PopMem(Arena);
 	}
@@ -1388,13 +1388,15 @@ static BOOL CacheUpToDate(const struct cl_command_info* Command, struct string_b
 
 	size_t CachePathLength = CachePathBuffer->Used;
 	PushString(STR("dep"), CachePathBuffer);
+	LPCWSTR DepFilePath = CachePathBuffer->Data;
 
 	CachePathBuffer->Used = CachePathLength; // Reset here already. The buffer is not used anymore so the pushed data stays valid.
 
-	if(!FileExists(CachePathBuffer->Data))
+	if(!FileExists(DepFilePath))
 		return FALSE;
 
-	struct dependency_info Deps = ReadDepFile(CachePathBuffer->Data, Arena);
+	struct dependency_info Deps = ReadDepFile(DepFilePath, Arena);
+	BOOL UpdateDepFile = FALSE;
 
 	for(UINT32 DepIndex = 0; DepIndex < Deps.EntryCount; ++DepIndex){
 		struct string FileName = Deps.Entries[DepIndex].FileName;
@@ -1432,14 +1434,23 @@ static BOOL CacheUpToDate(const struct cl_command_info* Command, struct string_b
 		if(FilePath.Length > 0 && GetFileSizeLastModified(FilePath.Data, &Size, &LastModified)){
 			if(Size == Deps.Entries[DepIndex].Size){
 				if(LastModified != Deps.Entries[DepIndex].LastModified){
-					if(HashFileContent(FilePath.Data, Arena) != Deps.Entries[DepIndex].Hash)
+					UINT64 Hash = HashFileContent(FilePath.Data, Arena);
+
+					if(Hash != Deps.Entries[DepIndex].Hash)
 						return FALSE;
+
+					// Update dependency file if timestamp has changed but the content is the same
+					Deps.Entries[DepIndex].LastModified = LastModified;
+					UpdateDepFile = TRUE;
 				}
 			}else{
 				return FALSE;
 			}
 		}
 	}
+
+	if(UpdateDepFile)
+		WriteDepFile(DepFilePath, &Deps, Arena);
 
 	return TRUE;
 }
