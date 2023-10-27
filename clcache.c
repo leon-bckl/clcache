@@ -794,7 +794,7 @@ static void ReadConfig(struct cache_config* Config){
 
 static void StartProcess(LPWSTR CmdLine, LPPROCESS_INFORMATION ProcessInfo, BOOL Detached, HANDLE Out, HANDLE Err){
 	STARTUPINFOW StartupInfo = {0};
-	DWORD CreationFlags = 0;
+	DWORD CreationFlags = CREATE_NO_WINDOW;
 
 	StartupInfo.cb = sizeof(StartupInfo);
 
@@ -808,7 +808,7 @@ static void StartProcess(LPWSTR CmdLine, LPPROCESS_INFORMATION ProcessInfo, BOOL
 
 	ZeroMemory(ProcessInfo, sizeof(*ProcessInfo));
 
-	if(!CreateProcessW(NULL, CmdLine, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &StartupInfo, ProcessInfo))
+	if(!CreateProcessW(NULL, CmdLine, NULL, NULL, TRUE, CreationFlags, NULL, NULL, &StartupInfo, ProcessInfo))
 		FatalError(CSTR("Failed to start process"));
 }
 
@@ -1120,10 +1120,10 @@ static LPWSTR BuildCommandLine(const struct cl_command_info* Command, struct mem
 	PushCmdLineArg(Command->Executable, STR(""), &CmdLineBuffer);
 
 	// Skip the first include path because that's the current directory which was added in BuildCommandInfo but shouldn't actually be passed to cl.exe
-	for(int i = 1; i < Command->IncludePaths.Count; ++i)
+	for(size_t i = 1; i < Command->IncludePaths.Count; ++i)
 		PushCmdLineArg(STR("/I"), Command->IncludePaths.Strings[i], &CmdLineBuffer);
 
-	for(int i = 0; i < Command->ExternalIncludePaths.Count; ++i)
+	for(size_t i = 0; i < Command->ExternalIncludePaths.Count; ++i)
 		PushCmdLineArg(STR("/external:I"), Command->ExternalIncludePaths.Strings[i], &CmdLineBuffer);
 
 	SortStrings(Command->CompilerFlags);
@@ -1131,7 +1131,7 @@ static LPWSTR BuildCommandLine(const struct cl_command_info* Command, struct mem
 	size_t CompilerFlagsStart = CmdLineBuffer.Used;
 	CompilerFlags->Data = CmdLineBuffer.Data + CmdLineBuffer.Used;
 
-	for(int i = 0; i < Command->CompilerFlags.Count; ++i)
+	for(size_t i = 0; i < Command->CompilerFlags.Count; ++i)
 		PushCmdLineArg(Command->CompilerFlags.Strings[i], STR(""), &CmdLineBuffer);
 
 	CompilerFlags->Length = CmdLineBuffer.Used - CompilerFlagsStart;
@@ -1268,9 +1268,10 @@ static void WriteDepFile(LPCWSTR Path, const struct dependency_info* Deps, struc
 }
 
 static int FindIncludePathFromFile(struct string_list IncludePaths, struct string FilePath){
-	for(int i = 0; i < IncludePaths.Count; ++i){
-		if(StringStartsWithCaseInsensitive(FilePath, IncludePaths.Strings[i]))
-			return i;
+	for(size_t i = 0; i < IncludePaths.Count; ++i){
+		struct string IncludePath = IncludePaths.Strings[i];
+		if(StringStartsWithCaseInsensitive(FilePath, IncludePath) && (IncludePath.Length == FilePath.Length || IsPathSeparator(IncludePath.Data[FilePath.Length])))
+			return (int)i;
 	}
 
 	return -1;
@@ -1363,7 +1364,7 @@ static struct dependency_info GenerateDeps(const struct cl_command_info* Command
 static struct string GetIncludeFileFullPath(struct string FileName, struct string_list IncludePaths, struct string_buffer* Buffer){
 	size_t BufferInitialUsed = Buffer->Used;
 
-	for(int i = 0; i < IncludePaths.Count; ++i){
+	for(size_t i = 0; i < IncludePaths.Count; ++i){
 		Buffer->Used = BufferInitialUsed;
 
 		if(IncludePaths.Strings[i].Length + FileName.Length + 2 >= Buffer->Size - Buffer->Used)
@@ -1421,7 +1422,7 @@ static BOOL CacheUpToDate(const struct cl_command_info* Command, struct string_b
 		struct string_buffer TempBuffer = MakeStringBuffer(TempBufferData, ARRAYSIZE(TempBufferData));
 		struct string FilePath = {0};
 
-		for(int i = 0; i < ARRAYSIZE(IncludePaths); ++i){
+		for(size_t i = 0; i < ARRAYSIZE(IncludePaths); ++i){
 			FilePath = GetIncludeFileFullPath(FileName, IncludePaths[i], &TempBuffer);
 
 			if(FilePath.Length > 0)
