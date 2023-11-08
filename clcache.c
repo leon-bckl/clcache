@@ -263,6 +263,7 @@ static void PopPartialMem(struct memory_arena* Arena, size_t Size){
  */
 
 static BOOL IsWhitespace(WCHAR C){ return C == ' ' || C == '\t' || C == '\n' || C == '\r'; }
+static BOOL IsAlpha(WCHAR C){ return (C >= 'A' && C <= 'Z') || (C >= 'a' && C <= 'z'); };
 static BOOL IsDigit(WCHAR C){ return C >= '0' && C <= '9'; }
 static BOOL IsPathSeparator(WCHAR C){ return C == '\\' || C == '/'; }
 
@@ -505,6 +506,10 @@ static struct cstring FloatToString(float Value, char* Buffer){
 	return Result;
 }
 
+static BOOL IsAbsolutePath(struct string Path){
+	return Path.Length > 2 && IsAlpha(Path.Data[0]) && Path.Data[1] == ':';
+}
+
 static struct string FileNameWithoutPath(struct string Path){
 	for(size_t i = Path.Length; i > 0; --i){
 		if(IsPathSeparator(Path.Data[i - 1]))
@@ -584,6 +589,44 @@ struct string_list SplitString(struct string Str, WCHAR Separator, struct memory
 	}
 
 	return List;
+}
+
+static struct string ConcatenateStrings(struct string S1, struct string S2, struct string_buffer* Buffer){
+	size_t CopySize;
+	size_t ResultSize;
+
+	if(S1.Data != Buffer->Data + Buffer->Used - S1.Length){
+		CopySize = Buffer->Size - Buffer->Used;
+		CopySize = min(S1.Length, CopySize);
+		CopyMemory(Buffer->Data + Buffer->Used, S1.Data, CopySize);
+		Buffer->Used += CopySize;
+		ResultSize = CopySize;
+	}else{
+		ResultSize = S1.Length;
+	}
+
+	CopySize = Buffer->Size - Buffer->Used;
+	CopySize = min(S2.Length, CopySize);
+	CopyMemory(Buffer->Data + Buffer->Used, S2.Data, CopySize);
+	Buffer->Used += CopySize;
+	ResultSize += CopySize;
+
+	return MakeString(Buffer->Data + Buffer->Used - ResultSize, ResultSize);
+}
+
+static struct string ConcatenatePaths(struct string P1, struct string P2, struct string_buffer* Buffer){
+	struct string Result;
+
+	if(P1.Length > 0 && !IsPathSeparator(P1.Data[P1.Length - 1]) && (P2.Length == 0 || !IsPathSeparator(P2.Data[0]))){
+		Result = ConcatenateStrings(P1, STR("\\"), Buffer);
+		Result = ConcatenateStrings(Result, P2, Buffer);
+	}else if(P1.Length > 0 && P2.Length > 0 && IsPathSeparator(P1.Data[P1.Length - 1]) && IsPathSeparator(P2.Data[0])){
+		Result = ConcatenateStrings(P1, StringRight(P2, P2.Length - 1), Buffer);
+	}else{
+		Result = ConcatenateStrings(P1, P2, Buffer);
+	}
+
+	return Result;
 }
 
 /*
@@ -928,12 +971,12 @@ static BOOL BuildCommandInfo(int argc, LPWSTR* argv, struct cl_command_info* Com
 	if(!Command->ClVersion)
 		return FALSE;
 
-	Command->IncludePaths.Strings = PushMem(Arena, argc * sizeof(struct string));
+
+	Command->CompilerFlags.Count = 0;
 	Command->CompilerFlags.Strings = PushMem(Arena, (argc - 2) * sizeof(struct string));
 
-	Command->IncludePaths.Count = 1;
-	Command->IncludePaths.Strings[0].Data = PushMem(Arena, MAX_PATH);
-	Command->IncludePaths.Strings[0].Length = GetCurrentDirectoryW(MAX_PATH, (LPWSTR)Command->IncludePaths.Strings[0].Data);
+	Command->IncludePaths.Count = 1; // The first include path will later be set based on the input source file
+	Command->IncludePaths.Strings = PushMem(Arena, argc * sizeof(struct string));
 
 	Command->ExternalIncludePaths.Count = 0;
 	Command->ExternalIncludePaths.Strings = PushMem(Arena, argc * sizeof(struct string));
@@ -1014,6 +1057,23 @@ static BOOL BuildCommandInfo(int argc, LPWSTR* argv, struct cl_command_info* Com
 
 	if(!CompilesToObj) // Only compile commands that result in object files are cacheable
 		return FALSE;
+
+	// Set first include path to directory containing the source file
+
+	if(IsAbsolutePath(Command->SrcFile)){
+		Command->IncludePaths.Strings[0] = PathWithoutFileName(Command->SrcFile);
+	}else{
+		void* Mem = PushMem(Arena, MAX_PATH);
+		struct string_buffer TempBuffer = MakeStringBuffer(Mem, MAX_PATH);
+		TempBuffer.Used = GetCurrentDirectoryW((DWORD)TempBuffer.Size, TempBuffer.Data);
+		struct string Prefix = MakeString(TempBuffer.Data, TempBuffer.Used);
+		struct string Path = ConcatenatePaths(Prefix, PathWithoutFileName(Command->SrcFile), &TempBuffer);
+
+		while(IsPathSeparator(Path.Data[Path.Length - 1]))
+			--Path.Length;
+
+		Command->IncludePaths.Strings[0] = Path;
+	}
 
 	// Set object file name if it wasn't explicitly specified
 
@@ -1270,7 +1330,7 @@ static void WriteDepFile(LPCWSTR Path, const struct dependency_info* Deps, struc
 static int FindIncludePathFromFile(struct string_list IncludePaths, struct string FilePath){
 	for(size_t i = 0; i < IncludePaths.Count; ++i){
 		struct string IncludePath = IncludePaths.Strings[i];
-		if(StringStartsWithCaseInsensitive(FilePath, IncludePath) && (IncludePath.Length == FilePath.Length || IsPathSeparator(IncludePath.Data[FilePath.Length])))
+		if(StringStartsWithCaseInsensitive(FilePath, IncludePath) && IsPathSeparator(FilePath.Data[IncludePath.Length]))
 			return (int)i;
 	}
 
@@ -1322,7 +1382,7 @@ static struct dependency_info GenerateDeps(const struct cl_command_info* Command
 			IncludePath = *FoundIncludePath;
 			FilePath = StringRight(FilePath, FilePath.Length - IncludePath.Length);
 
-			while(FilePath.Data[0] == '\\'){
+			while(IsPathSeparator(FilePath.Data[0])){
 				++FilePath.Data;
 				--FilePath.Length;
 			}
