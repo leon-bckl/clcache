@@ -598,7 +598,7 @@ static struct string ConcatenateStrings(struct string S1, struct string S2, stru
 	if(S1.Data != Buffer->Data + Buffer->Used - S1.Length){
 		CopySize = Buffer->Size - Buffer->Used;
 		CopySize = min(S1.Length, CopySize);
-		CopyMemory(Buffer->Data + Buffer->Used, S1.Data, CopySize);
+		CopyMemory(Buffer->Data + Buffer->Used, S1.Data, CopySize * sizeof(WCHAR));
 		Buffer->Used += CopySize;
 		ResultSize = CopySize;
 	}else{
@@ -607,7 +607,7 @@ static struct string ConcatenateStrings(struct string S1, struct string S2, stru
 
 	CopySize = Buffer->Size - Buffer->Used;
 	CopySize = min(S2.Length, CopySize);
-	CopyMemory(Buffer->Data + Buffer->Used, S2.Data, CopySize);
+	CopyMemory(Buffer->Data + Buffer->Used, S2.Data, CopySize * sizeof(WCHAR));
 	Buffer->Used += CopySize;
 	ResultSize += CopySize;
 
