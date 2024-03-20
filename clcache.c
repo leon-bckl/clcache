@@ -1128,10 +1128,25 @@ static BOOL BuildCommandInfo(int argc, LPWSTR* argv, struct cl_command_info* Com
 
 				if(*Flag == 'I')
 				{
-					if(External)
-						Command->ExternalIncludePaths.Strings[Command->ExternalIncludePaths.Count++] = StringFromWchar(Flag + 1);
+					struct string IncPath;
+
+					if(!Flag[1])
+					{
+						if(i == argc - 1)
+							return FALSE;
+
+						IncPath = StringFromWchar(argv[i + 1]);
+						++i;
+					}
 					else
-						Command->IncludePaths.Strings[Command->IncludePaths.Count++] = StringFromWchar(Flag + 1);
+					{
+						IncPath = StringFromWchar(Flag + 1);
+					}
+
+					if(External)
+						Command->ExternalIncludePaths.Strings[Command->ExternalIncludePaths.Count++] = IncPath;
+					else
+						Command->IncludePaths.Strings[Command->IncludePaths.Count++] = IncPath;
 
 					continue;
 				}
